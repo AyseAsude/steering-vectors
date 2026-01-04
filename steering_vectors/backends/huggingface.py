@@ -46,12 +46,48 @@ class HuggingFaceBackend(ModelBackend):
             param.requires_grad = False
 
     def get_hidden_dim(self) -> int:
-        """Return hidden dimension from config."""
-        return self.model.config.hidden_size
+        """Return hidden dimension from config.
+        
+        Handles different model architectures:
+        - Standard models: config.hidden_size
+        - Multimodal models (e.g., Gemma3): config.text_config.hidden_size
+        """
+        config = self.model.config
+        
+        # Try standard hidden_size first
+        if hasattr(config, 'hidden_size'):
+            return config.hidden_size
+        
+        # For multimodal models like Gemma3, hidden_size is in text_config
+        if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+            return config.text_config.hidden_size
+        
+        raise AttributeError(
+            f"Cannot find hidden dimension in {type(config).__name__}. "
+            f"Expected 'hidden_size' or 'text_config.hidden_size' attribute."
+        )
 
     def get_num_layers(self) -> int:
-        """Return number of layers from config."""
-        return self.model.config.num_hidden_layers
+        """Return number of layers from config.
+        
+        Handles different model architectures:
+        - Standard models: config.num_hidden_layers
+        - Multimodal models (e.g., Gemma3): config.text_config.num_hidden_layers
+        """
+        config = self.model.config
+        
+        # Try standard num_hidden_layers first
+        if hasattr(config, 'num_hidden_layers'):
+            return config.num_hidden_layers
+        
+        # For multimodal models like Gemma3, num_hidden_layers is in text_config
+        if hasattr(config, 'text_config') and hasattr(config.text_config, 'num_hidden_layers'):
+            return config.text_config.num_hidden_layers
+        
+        raise AttributeError(
+            f"Cannot find number of layers in {type(config).__name__}. "
+            f"Expected 'num_hidden_layers' or 'text_config.num_hidden_layers' attribute."
+        )
 
     def get_device(self) -> str:
         """Return model device."""
@@ -72,9 +108,27 @@ class HuggingFaceBackend(ModelBackend):
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
     def _get_layer(self, layer_idx: int):
-        """Get the transformer layer module."""
-        # Works for Llama, Qwen, Mistral, etc.
-        return self.model.model.layers[layer_idx]
+        """Get the transformer layer module.
+        
+        Handles different model architectures:
+        - Standard models (Llama, Qwen, Mistral): model.model.layers
+        - Multimodal models (e.g., Gemma3): model.language_model.model.layers
+        """
+        # Try standard structure first (Llama, Qwen, Mistral, etc.)
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            return self.model.model.layers[layer_idx]
+        
+        # For multimodal models like Gemma3, layers are in language_model
+        if hasattr(self.model, 'language_model'):
+            if hasattr(self.model.language_model, 'model') and hasattr(self.model.language_model.model, 'layers'):
+                return self.model.language_model.model.layers[layer_idx]
+            if hasattr(self.model.language_model, 'layers'):
+                return self.model.language_model.layers[layer_idx]
+        
+        raise AttributeError(
+            f"Cannot find layers in {type(self.model).__name__}. "
+            f"Expected 'model.layers', 'language_model.model.layers', or 'language_model.layers'."
+        )
 
     def register_hook(self, layer: int, hook_fn: Callable) -> Any:
         """Register forward pre-hook at layer."""

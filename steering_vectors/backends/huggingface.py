@@ -175,7 +175,9 @@ class HuggingFaceBackend(ModelBackend):
         with self.hooks_context(hooks):
             output_ids = self.model.generate(input_ids, **generation_kwargs)
 
-        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        # Only decode the newly generated tokens, not the input prompt
+        new_tokens = output_ids[0][input_ids.shape[1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     def get_completion_probability(
         self,

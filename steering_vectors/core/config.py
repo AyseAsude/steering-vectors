@@ -13,14 +13,10 @@ class OptimizationConfig(BaseModel):
     Attributes:
         lr: Learning rate for Adam optimizer.
         max_iters: Maximum number of optimization steps.
-        target_loss: Stop when loss falls below this threshold.
         coldness: Inverse temperature for softmax (higher = sharper).
         starting_norm: Initial norm of the steering vector.
         max_norm: Clip vector norm to this value after each step.
-        target_loss_iters: Stop after this many consecutive steps below target.
-        eps: Small constant for numerical stability.
-        sum_losses: If True, use sum of losses; else check each completion.
-        satisfice: If True, optimize squared diff from target_loss.
+        satisfice: If True, optimize squared diff from per-datapoint target losses.
         normalize_by_length: Divide loss by completion length.
         use_one_minus: For suppression, use log(1-p) vs -log(p).
     """
@@ -28,11 +24,6 @@ class OptimizationConfig(BaseModel):
     # Basic optimization
     lr: float = Field(default=0.1, gt=0)
     max_iters: int = Field(default=50, gt=0)
-
-    # Early stopping
-    target_loss: Optional[float] = None
-    target_loss_iters: int = Field(default=1, ge=1)
-    eps: float = Field(default=1e-6, gt=0)
 
     # Temperature
     coldness: float = Field(default=0.7, gt=0)
@@ -42,13 +33,9 @@ class OptimizationConfig(BaseModel):
     max_norm: Optional[float] = Field(default=None, gt=0)
 
     # Loss behavior
-    sum_losses: bool = True
     satisfice: bool = False
     normalize_by_length: bool = False
     use_one_minus: bool = True
-
-    # Debugging
-    debug: bool = False
 
     class Config:
         frozen = False  # Allow modification after creation

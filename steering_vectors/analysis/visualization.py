@@ -34,7 +34,7 @@ def plot_similarity_matrix(
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    im = ax.imshow(matrix.numpy() if isinstance(matrix, torch.Tensor) else matrix,
+    im = ax.imshow(matrix.cpu().float().numpy() if isinstance(matrix, torch.Tensor) else matrix,
                    cmap=cmap, vmin=-1, vmax=1)
 
     if labels:

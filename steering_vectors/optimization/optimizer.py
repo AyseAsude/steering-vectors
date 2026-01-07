@@ -13,7 +13,7 @@ The optimization works by:
 5. Repeating until the vector reliably induces the desired behavior
 """
 
-from typing import List, Optional, Union, Tuple, Dict, Any
+from typing import List, Optional, Union, Tuple, Dict, Any, Callable
 
 import torch
 
@@ -29,6 +29,11 @@ from steering_vectors.optimization.loss import (
     SuppressionLoss,
 )
 from steering_vectors.optimization.callbacks import OptimizationCallback
+from steering_vectors.optimization.noise import (
+    NoiseApplicator,
+    create_noise_applicator,
+    identity_projector,
+)
 
 
 class SteeringOptimizer:
@@ -80,6 +85,11 @@ class SteeringOptimizer:
         self.config = config or OptimizationConfig()
         self.callbacks = callbacks or []
 
+        # Create noise applicator from config (None if noise disabled)
+        self._noise_applicator: Optional[NoiseApplicator] = create_noise_applicator(
+            self.config.noise
+        )
+
     def optimize(
         self,
         datapoints: List[TrainingDatapoint],
@@ -107,6 +117,10 @@ class SteeringOptimizer:
         """
         # Normalize layer to list (supports single int or list of ints)
         layers = [layer] if isinstance(layer, int) else list(layer)
+
+        # Reset noise state if using noisy steering
+        if self._noise_applicator:
+            self._noise_applicator.reset()
 
         # =====================================================================
         # STEP 1: Initialize the steering vector with random values
@@ -276,6 +290,9 @@ class SteeringOptimizer:
         4. For src_completions: compute -log(1-P(completion)) [suppress]
         5. Sum all losses
 
+        If noise is enabled, each completion is evaluated multiple times
+        (noise_iters) with different noise perturbations.
+
         The loss represents "how far are we from the desired behavior?"
         Lower loss = model behaves more as desired.
 
@@ -300,79 +317,231 @@ class SteeringOptimizer:
             normalize_by_length=self.config.normalize_by_length,
         )
 
+        # Determine number of noise iterations
+        noise_iters = (
+            self._noise_applicator.noise_iters if self._noise_applicator else 1
+        )
+
+        # Check if we need gradient for tangent space projection
+        needs_gradient = (
+            self._noise_applicator is not None
+            and self._noise_applicator.projector != identity_projector()
+        )
+
         # Process each datapoint
         for dp_idx, (dp, tokens) in enumerate(zip(datapoints, tokenized_data)):
-            dp_losses = [[], []]  # [src_losses, dst_losses]
-
-            # -----------------------------------------------------------------
-            # Create the steering hook for this datapoint
-            # -----------------------------------------------------------------
-            # If negate=True, we flip the vector sign (useful for contrastive training)
-            vector_sign = -1 if dp.negate else 1
-            hook = self.steering_mode.create_hook(
-                token_slice=dp.token_slice,
-                strength=float(vector_sign),
-            )
-            # Apply the same hook to all specified layers
-            hooks = [(layer, hook) for layer in layers]
+            dp_losses: List[List[float]] = [[], []]  # [src_losses, dst_losses]
 
             # -----------------------------------------------------------------
             # Suppression: make src_completions LESS likely
             # -----------------------------------------------------------------
-            # For each completion we want to suppress, we compute loss that
-            # penalizes high probability of that completion.
             for comp_idx, comp_tokens in enumerate(tokens["src_tokens"]):
-                # Run model with steering hook attached
-                with self.backend.hooks_context(hooks):
-                    logits = self.backend.get_logits(comp_tokens["full_ids"])[0]
+                comp_loss_sum = 0.0
 
-                # Compute suppression loss: -log(1 - P(token)) for each token
-                # High P(token) → high loss → gradient pushes to reduce P
-                loss = suppression_loss.compute(
-                    logits,
-                    comp_tokens["full_ids"][0],
-                    comp_tokens["prompt_len"],
-                    coldness=self.config.coldness,
-                )
+                for _ in range(noise_iters):
+                    # Get vector, possibly with noise applied
+                    vector = self._get_vector_for_loss(
+                        comp_tokens,
+                        layers,
+                        suppression_loss,
+                        is_src=True,
+                        needs_gradient=needs_gradient,
+                    )
 
-                # Satisficing: instead of minimizing, aim for target value
-                # Loss becomes (actual - target)² which is minimized at target
-                if self.config.satisfice and dp.src_target_losses:
-                    target = dp.src_target_losses[comp_idx]
-                    loss = (loss - target) ** 2
+                    # Create hook with this vector
+                    vector_sign = -1 if dp.negate else 1
+                    hook = self._create_hook_with_vector(
+                        vector, dp.token_slice, vector_sign
+                    )
+                    hooks = [(layer, hook) for layer in layers]
 
-                total_loss = total_loss + loss
-                dp_losses[0].append(loss.item())
+                    # Compute loss
+                    with self.backend.hooks_context(hooks):
+                        logits = self.backend.get_logits(comp_tokens["full_ids"])[0]
+
+                    loss = suppression_loss.compute(
+                        logits,
+                        comp_tokens["full_ids"][0],
+                        comp_tokens["prompt_len"],
+                        coldness=self.config.coldness,
+                    )
+
+                    # Satisficing: aim for target value
+                    if self.config.satisfice and dp.src_target_losses:
+                        target = dp.src_target_losses[comp_idx]
+                        loss = (loss - target) ** 2
+
+                    total_loss = total_loss + loss
+                    comp_loss_sum += loss.item()
+
+                # Store average loss for this completion
+                dp_losses[0].append(comp_loss_sum / noise_iters)
 
             # -----------------------------------------------------------------
             # Promotion: make dst_completions MORE likely
             # -----------------------------------------------------------------
-            # For each completion we want to promote, we compute loss that
-            # penalizes low probability of that completion.
             for comp_idx, comp_tokens in enumerate(tokens["dst_tokens"]):
-                with self.backend.hooks_context(hooks):
-                    logits = self.backend.get_logits(comp_tokens["full_ids"])[0]
+                comp_loss_sum = 0.0
 
-                # Compute promotion loss: -log(P(token)) for each token
-                # Low P(token) → high loss → gradient pushes to increase P
-                loss = promotion_loss.compute(
-                    logits,
-                    comp_tokens["full_ids"][0],
-                    comp_tokens["prompt_len"],
-                    coldness=self.config.coldness,
-                )
+                for _ in range(noise_iters):
+                    # Get vector, possibly with noise applied
+                    vector = self._get_vector_for_loss(
+                        comp_tokens,
+                        layers,
+                        promotion_loss,
+                        is_src=False,
+                        needs_gradient=needs_gradient,
+                    )
 
-                # Satisficing: aim for target value instead of minimizing
-                if self.config.satisfice and dp.dst_target_losses:
-                    target = dp.dst_target_losses[comp_idx]
-                    loss = (loss - target) ** 2
+                    # Create hook with this vector
+                    vector_sign = -1 if dp.negate else 1
+                    hook = self._create_hook_with_vector(
+                        vector, dp.token_slice, vector_sign
+                    )
+                    hooks = [(layer, hook) for layer in layers]
 
-                total_loss = total_loss + loss
-                dp_losses[1].append(loss.item())
+                    # Compute loss
+                    with self.backend.hooks_context(hooks):
+                        logits = self.backend.get_logits(comp_tokens["full_ids"])[0]
+
+                    loss = promotion_loss.compute(
+                        logits,
+                        comp_tokens["full_ids"][0],
+                        comp_tokens["prompt_len"],
+                        coldness=self.config.coldness,
+                    )
+
+                    # Satisficing: aim for target value
+                    if self.config.satisfice and dp.dst_target_losses:
+                        target = dp.dst_target_losses[comp_idx]
+                        loss = (loss - target) ** 2
+
+                    total_loss = total_loss + loss
+                    comp_loss_sum += loss.item()
+
+                # Store average loss for this completion
+                dp_losses[1].append(comp_loss_sum / noise_iters)
 
             per_completion_losses.append(dp_losses)
 
         return total_loss, per_completion_losses
+
+    def _get_vector_for_loss(
+        self,
+        comp_tokens: Dict,
+        layers: List[int],
+        loss_fn: LossComponent,
+        is_src: bool,
+        needs_gradient: bool,
+    ) -> torch.Tensor:
+        """
+        Get the steering vector, optionally with noise applied.
+
+        If noise is enabled, applies noise to the vector.
+        If tangent space projection is enabled, computes gradient first.
+
+        Args:
+            comp_tokens: Tokenized completion data.
+            layers: Layers to apply steering to.
+            loss_fn: Loss function (for gradient computation).
+            is_src: Whether this is a suppression (src) completion.
+            needs_gradient: Whether gradient is needed for noise projection.
+
+        Returns:
+            The (possibly noisy) steering vector.
+        """
+        vector = self.steering_mode.get_vector()
+
+        if self._noise_applicator is None:
+            return vector
+
+        gradient = None
+        if needs_gradient:
+            gradient = self._compute_gradient_for_noise(
+                comp_tokens, layers, loss_fn
+            )
+
+        return self._noise_applicator.apply(vector, gradient)
+
+    def _create_hook_with_vector(
+        self,
+        vector: torch.Tensor,
+        token_slice: Any,
+        strength: float,
+    ) -> Callable:
+        """
+        Create a steering hook that uses a specific vector.
+
+        This is needed for noisy steering where we want to inject
+        a modified vector rather than the one stored in steering_mode.
+
+        Args:
+            vector: The vector to inject.
+            token_slice: Which tokens to apply steering to.
+            strength: Multiplier for the vector (e.g., -1 for negation).
+
+        Returns:
+            A hook function for forward_pre_hook.
+        """
+        idx = token_slice if token_slice is not None else slice(None)
+
+        def hook_fn(module, args):
+            hidden_states = args[0]  # Shape: [batch, seq_len, hidden_dim]
+            modified = hidden_states.clone()
+            modified[:, idx] = modified[:, idx] + strength * vector.to(
+                modified.device, modified.dtype
+            )
+            return (modified,) + args[1:]
+
+        return hook_fn
+
+    def _compute_gradient_for_noise(
+        self,
+        comp_tokens: Dict,
+        layers: List[int],
+        loss_fn: LossComponent,
+    ) -> torch.Tensor:
+        """
+        Compute gradient of unsteered loss for tangent space projection.
+
+        This runs a forward pass with a zero vector and computes the gradient
+        of the loss with respect to that vector. This gradient represents
+        the "optimization direction" that noise should avoid.
+
+        Args:
+            comp_tokens: Tokenized completion data.
+            layers: Layers for steering.
+            loss_fn: Loss function to use.
+
+        Returns:
+            Gradient tensor of shape (hidden_dim,).
+        """
+        # Create a zero vector that requires grad
+        zero_vec = torch.zeros(
+            self.backend.get_hidden_dim(),
+            device=self.backend.get_device(),
+            dtype=self.backend.get_dtype(),
+            requires_grad=True,
+        )
+
+        # Forward pass with zero steering
+        hook = self._create_hook_with_vector(zero_vec, None, 1.0)
+        hooks = [(layers[0], hook)]
+
+        with self.backend.hooks_context(hooks):
+            logits = self.backend.get_logits(comp_tokens["full_ids"])[0]
+
+        # Compute loss
+        loss = loss_fn.compute(
+            logits,
+            comp_tokens["full_ids"][0],
+            comp_tokens["prompt_len"],
+            coldness=self.config.coldness,
+        )
+
+        # Get gradient
+        grad = torch.autograd.grad(loss, zero_vec)[0]
+        return grad.detach()
 
     def _run_callbacks(
         self,

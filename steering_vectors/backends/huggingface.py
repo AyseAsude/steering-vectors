@@ -112,11 +112,16 @@ class HuggingFaceBackend(ModelBackend):
         
         Handles different model architectures:
         - Standard models (Llama, Qwen, Mistral): model.model.layers
+        - GPTNeoX models: model.gpt_neox.layers
         - Multimodal models (e.g., Gemma3): model.language_model.model.layers
         """
         # Try standard structure first (Llama, Qwen, Mistral, etc.)
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
             return self.model.model.layers[layer_idx]
+        
+        # For GPTNeoX models
+        if hasattr(self.model, 'gpt_neox') and hasattr(self.model.gpt_neox, 'layers'):
+            return self.model.gpt_neox.layers[layer_idx]
         
         # For multimodal models like Gemma3, layers are in language_model
         if hasattr(self.model, 'language_model'):
@@ -127,7 +132,7 @@ class HuggingFaceBackend(ModelBackend):
         
         raise AttributeError(
             f"Cannot find layers in {type(self.model).__name__}. "
-            f"Expected 'model.layers', 'language_model.model.layers', or 'language_model.layers'."
+            f"Expected 'model.layers', 'gpt_neox.layers', 'language_model.model.layers', or 'language_model.layers'."
         )
 
     def register_hook(self, layer: int, hook_fn: Callable) -> Any:

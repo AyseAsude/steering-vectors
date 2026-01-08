@@ -114,10 +114,12 @@ class SteeringOptimizer:
         # The steering mode owns the parameter(s). For VectorSteering, this is
         # just a single vector of shape (hidden_dim,). For AffineSteering, it
         # includes a low-rank matrix as well.
+        # Always use float32 for steering parameters for numerical stability.
+        # Half-precision (float16/bfloat16) can cause issues with gradients.
         self.steering_mode.init_parameters(
             hidden_dim=self.backend.get_hidden_dim(),
             device=self.backend.get_device(),
-            dtype=self.backend.get_dtype(),
+            dtype=torch.float32,
             starting_norm=self.config.starting_norm,
         )
 

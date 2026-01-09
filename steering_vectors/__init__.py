@@ -36,7 +36,7 @@ Example usage:
 """
 
 from steering_vectors.core.datapoint import TrainingDatapoint
-from steering_vectors.core.config import OptimizationConfig
+from steering_vectors.core.config import OptimizationConfig, ManifoldConfig
 from steering_vectors.core.result import OptimizationResult
 
 from steering_vectors.steering.base import SteeringMode
@@ -53,6 +53,8 @@ from steering_vectors.optimization.loss import (
     PromotionLoss,
     SuppressionLoss,
     CompositeLoss,
+    RegularizerComponent,
+    ManifoldLoss,
 )
 from steering_vectors.optimization.callbacks import (
     OptimizationCallback,
@@ -71,6 +73,7 @@ __all__ = [
     "TrainingDatapoint",
     "OptimizationConfig",
     "OptimizationResult",
+    "ManifoldConfig",
     # Steering modes
     "SteeringMode",
     "VectorSteering",
@@ -85,6 +88,8 @@ __all__ = [
     "PromotionLoss",
     "SuppressionLoss",
     "CompositeLoss",
+    "RegularizerComponent",
+    "ManifoldLoss",
     # Callbacks
     "OptimizationCallback",
     "EarlyStoppingCallback",

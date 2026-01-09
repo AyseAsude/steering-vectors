@@ -7,6 +7,9 @@ from steering_vectors.optimization.loss import (
     SuppressionLoss,
     CompositeLoss,
     SatisficingLoss,
+    WeightedLoss,
+    RegularizerComponent,
+    ManifoldLoss,
 )
 from steering_vectors.optimization.callbacks import (
     OptimizationCallback,
@@ -23,6 +26,9 @@ __all__ = [
     "SuppressionLoss",
     "CompositeLoss",
     "SatisficingLoss",
+    "WeightedLoss",
+    "RegularizerComponent",
+    "ManifoldLoss",
     "OptimizationCallback",
     "EarlyStoppingCallback",
     "LoggingCallback",

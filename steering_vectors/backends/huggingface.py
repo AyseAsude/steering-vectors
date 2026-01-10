@@ -156,6 +156,64 @@ class HuggingFaceBackend(ModelBackend):
             outputs = self.model(input_ids, use_cache=False)
             return outputs.logits
 
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        hooks: Optional[List[Tuple[int, Callable]]] = None,
+        **kwargs,
+    ) -> List[str]:
+        """
+        Generate text for multiple prompts in a batch.
+
+        Args:
+            prompts: List of input prompts.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            do_sample: Whether to sample or use greedy.
+            hooks: Optional hooks to apply during generation.
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            List of generated texts (one per prompt).
+        """
+        hooks = hooks or []
+
+        # Set up padding for batch generation
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(self.get_device())
+
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            **kwargs,
+        }
+
+        with self.hooks_context(hooks):
+            output_ids = self.model.generate(**inputs, **generation_kwargs)
+
+        # Restore original padding side
+        self.tokenizer.padding_side = original_padding_side
+
+        # Decode only the newly generated tokens
+        input_len = inputs["input_ids"].shape[1]
+        return self.tokenizer.batch_decode(
+            output_ids[:, input_len:], skip_special_tokens=True
+        )
+
     def generate(
         self,
         prompt: str,
@@ -166,23 +224,14 @@ class HuggingFaceBackend(ModelBackend):
         **kwargs,
     ) -> str:
         """Generate text with optional steering."""
-        input_ids = self.tokenize(prompt)
-        hooks = hooks or []
-
-        generation_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "do_sample": do_sample,
-            "pad_token_id": self.tokenizer.eos_token_id,
+        return self.generate_batch(
+            [prompt],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            hooks=hooks,
             **kwargs,
-        }
-
-        with self.hooks_context(hooks):
-            output_ids = self.model.generate(input_ids, **generation_kwargs)
-
-        # Only decode the newly generated tokens, not the input prompt
-        new_tokens = output_ids[0][input_ids.shape[1]:]
-        return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        )[0]
 
     def get_completion_probability(
         self,

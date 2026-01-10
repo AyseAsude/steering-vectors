@@ -61,6 +61,17 @@ class TransformerLensBackend(ModelBackend):
     def remove_hook(self, handle: Any) -> None:
         raise NotImplementedError
 
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        hooks: Optional[List[Tuple[int, Callable]]] = None,
+        **kwargs,
+    ) -> List[str]:
+        raise NotImplementedError
+
     def generate(
         self,
         prompt: str,

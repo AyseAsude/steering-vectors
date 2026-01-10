@@ -133,6 +133,32 @@ class ModelBackend(ABC):
                 self.remove_hook(handle)
 
     @abstractmethod
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        hooks: Optional[List[Tuple[int, Callable]]] = None,
+        **kwargs,
+    ) -> List[str]:
+        """
+        Generate text for multiple prompts in a batch.
+
+        Args:
+            prompts: List of input prompts.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            do_sample: Whether to sample or use greedy.
+            hooks: Optional hooks to apply during generation.
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            List of generated texts (one per prompt).
+        """
+        ...
+
+    @abstractmethod
     def generate(
         self,
         prompt: str,
@@ -154,7 +180,7 @@ class ModelBackend(ABC):
             **kwargs: Additional generation arguments.
 
         Returns:
-            Generated text (including prompt).
+            Generated text (excluding prompt).
         """
         ...
 
@@ -192,6 +218,41 @@ class ModelBackend(ABC):
         ]
 
         return self.generate(prompt, hooks=hooks, **kwargs)
+
+    def generate_with_steering_batch(
+        self,
+        prompts: List[str],
+        steering_mode: SteeringMode,
+        layers: LayerSpec,
+        strength: float = 1.0,
+        token_slice: TokenSpec = None,
+        **kwargs,
+    ) -> List[str]:
+        """
+        Generate text for multiple prompts with steering applied.
+
+        Convenience method that wraps generate_batch() with proper hooks.
+
+        Args:
+            prompts: List of input prompts.
+            steering_mode: The steering mode to apply.
+            layers: Layer(s) to apply steering at.
+            strength: Steering strength multiplier.
+            token_slice: Which tokens to steer.
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            List of generated texts.
+        """
+        if isinstance(layers, int):
+            layers = [layers]
+
+        hooks = [
+            (layer, steering_mode.create_hook(token_slice, strength))
+            for layer in layers
+        ]
+
+        return self.generate_batch(prompts, hooks=hooks, **kwargs)
 
     @abstractmethod
     def get_completion_probability(

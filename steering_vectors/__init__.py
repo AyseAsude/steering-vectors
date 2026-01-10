@@ -43,6 +43,7 @@ from steering_vectors.steering.base import SteeringMode
 from steering_vectors.steering.vector import VectorSteering
 from steering_vectors.steering.clamp import ClampSteering
 from steering_vectors.steering.affine import AffineSteering
+from steering_vectors.steering.difference_in_means import DifferenceInMeansSteering
 
 from steering_vectors.backends.base import ModelBackend
 from steering_vectors.backends.huggingface import HuggingFaceBackend
@@ -79,6 +80,7 @@ __all__ = [
     "VectorSteering",
     "ClampSteering",
     "AffineSteering",
+    "DifferenceInMeansSteering",
     # Backends
     "ModelBackend",
     "HuggingFaceBackend",

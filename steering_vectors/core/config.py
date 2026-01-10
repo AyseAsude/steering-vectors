@@ -57,3 +57,47 @@ class NoiseConfig(BaseModel):
     noise_abl_relu: bool = False
     noise_iters: int = Field(default=1, ge=1)
     anti_pgd: bool = False
+
+
+class ManifoldConfig(BaseModel):
+    """
+    Configuration for manifold regularization.
+
+    Used with ManifoldLoss to keep steering vectors on the manifold
+    of natural model activations.
+    """
+
+    # Data collection
+    n_samples: int = Field(
+        default=100,
+        gt=0,
+        description="Number of Alpaca samples to use for PCA.",
+    )
+    num_activations_per_sample: int = Field(
+        default=10,
+        gt=0,
+        description="Number of activation vectors to sample per example.",
+    )
+    layer: int = Field(
+        default=16,
+        ge=0,
+        description="Layer to extract activations from.",
+    )
+
+    # PCA configuration
+    explained_variance_threshold: float = Field(
+        default=0.95,
+        gt=0,
+        le=1.0,
+        description="Fraction of variance to explain with PCA components.",
+    )
+
+    # Loss weighting
+    weight: float = Field(
+        default=1.0,
+        gt=0,
+        description="Weight for manifold loss (lambda).",
+    )
+
+    # Reproducibility
+    seed: int = Field(default=42, description="Random seed for sampling.")

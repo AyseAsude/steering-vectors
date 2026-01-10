@@ -27,6 +27,7 @@ from steering_vectors.optimization.loss import (
     LossComponent,
     PromotionLoss,
     SuppressionLoss,
+    RegularizerComponent,
 )
 from steering_vectors.optimization.callbacks import OptimizationCallback
 
@@ -65,6 +66,8 @@ class SteeringOptimizer:
         steering_mode: SteeringMode,
         config: Optional[OptimizationConfig] = None,
         callbacks: Optional[List[OptimizationCallback]] = None,
+        regularizer: Optional[RegularizerComponent] = None,
+        regularizer_weight: float = 1.0,
     ):
         """
         Initialize the optimizer.
@@ -74,11 +77,15 @@ class SteeringOptimizer:
             steering_mode: Strategy for modifying activations (e.g., VectorSteering).
             config: Hyperparameters (learning rate, iterations, etc.).
             callbacks: Optional callbacks for logging, early stopping, etc.
+            regularizer: Optional regularization component (e.g., ManifoldLoss).
+            regularizer_weight: Weight for the regularization term (lambda).
         """
         self.backend = backend
         self.steering_mode = steering_mode
         self.config = config or OptimizationConfig()
         self.callbacks = callbacks or []
+        self.regularizer = regularizer
+        self.regularizer_weight = regularizer_weight
 
     def optimize(
         self,
@@ -156,6 +163,15 @@ class SteeringOptimizer:
             total_loss, per_completion_losses = self._compute_batch_loss(
                 datapoints, tokenized_data, layers
             )
+
+            # -----------------------------------------------------------------
+            # STEP 3a.5: Add regularization term (if configured)
+            # -----------------------------------------------------------------
+            # Regularizers like ManifoldLoss add constraints on the vector
+            # itself (e.g., staying on the manifold of natural activations).
+            if self.regularizer is not None:
+                reg_loss = self.regularizer.compute(self.steering_mode)
+                total_loss = total_loss + self.regularizer_weight * reg_loss
 
             # -----------------------------------------------------------------
             # STEP 3b: Backpropagate to get gradients

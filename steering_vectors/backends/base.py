@@ -92,9 +92,29 @@ class ModelBackend(ABC):
         """
         Register a forward pre-hook at the specified layer.
 
+        This captures the INPUT to the layer (residual stream before the layer).
+        Used for steering (modifying activations before they enter the layer).
+
         Args:
             layer: Layer index.
-            hook_fn: Hook function.
+            hook_fn: Hook function with signature (module, args) -> args.
+
+        Returns:
+            Hook handle for later removal.
+        """
+        ...
+
+    @abstractmethod
+    def register_output_hook(self, layer: int, hook_fn: Callable) -> Any:
+        """
+        Register a forward hook at the specified layer to capture output.
+
+        This captures the OUTPUT of the layer (residual stream after the layer).
+        Used for extracting activations.
+
+        Args:
+            layer: Layer index.
+            hook_fn: Hook function with signature (module, args, output) -> output or None.
 
         Returns:
             Hook handle for later removal.
@@ -107,14 +127,14 @@ class ModelBackend(ABC):
         Remove a previously registered hook.
 
         Args:
-            handle: Hook handle from register_hook.
+            handle: Hook handle from register_hook or register_output_hook.
         """
         ...
 
     @contextmanager
     def hooks_context(self, hook_infos: List[Tuple[int, Callable]]):
         """
-        Context manager for temporary hooks.
+        Context manager for temporary pre-hooks (for steering).
 
         Args:
             hook_infos: List of (layer, hook_fn) pairs.
@@ -126,6 +146,27 @@ class ModelBackend(ABC):
         try:
             for layer, hook_fn in hook_infos:
                 handle = self.register_hook(layer, hook_fn)
+                handles.append(handle)
+            yield
+        finally:
+            for handle in handles:
+                self.remove_hook(handle)
+
+    @contextmanager
+    def output_hooks_context(self, hook_infos: List[Tuple[int, Callable]]):
+        """
+        Context manager for temporary output hooks (for extraction).
+
+        Args:
+            hook_infos: List of (layer, hook_fn) pairs.
+
+        Yields:
+            None. Hooks are active within the context.
+        """
+        handles = []
+        try:
+            for layer, hook_fn in hook_infos:
+                handle = self.register_output_hook(layer, hook_fn)
                 handles.append(handle)
             yield
         finally:

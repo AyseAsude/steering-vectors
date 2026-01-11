@@ -6,7 +6,7 @@ the difference between mean activations of contrastive examples.
 Formula: v = mean(positive_activations) - mean(negative_activations)
 """
 
-from typing import Callable, List, Optional, Union, TYPE_CHECKING
+from typing import Callable, List, Literal, Optional, TYPE_CHECKING
 
 import torch
 
@@ -26,14 +26,6 @@ class DifferenceInMeansSteering(SteeringMode):
     in a single forward pass.
 
     Once computed, the vector can be used for steering like VectorSteering.
-
-    Example with plain texts:
-        >>> steering = DifferenceInMeansSteering.from_contrastive_texts(
-        ...     backend,
-        ...     positive_texts=["I love this!", "This is great!"],
-        ...     negative_texts=["I hate this!", "This is terrible!"],
-        ...     layer=16,
-        ... )
 
     Example with chat messages (recommended for chat models):
         >>> steering = DifferenceInMeansSteering.from_contrastive_messages(
@@ -71,12 +63,10 @@ class DifferenceInMeansSteering(SteeringMode):
         positive_messages: List[List[dict]],
         negative_messages: List[List[dict]],
         layer: int,
+        token_position: Literal["last_prompt_token", "mean"] = "mean",
     ) -> "DifferenceInMeansSteering":
         """
         Compute steering vector from contrastive chat message pairs.
-
-        Extracts activations only from assistant response tokens, computing
-        the mean across all response positions for each example.
 
         This method handles chat template application and response boundary
         detection internally, ensuring reliable extraction.
@@ -90,6 +80,10 @@ class DifferenceInMeansSteering(SteeringMode):
             negative_messages: List of message lists representing negative examples.
                 Same format as positive_messages.
             layer: Layer index to extract activations from.
+            token_position: Which token position to extract activations from.
+                - "last_prompt_token": Activation at the last token of the prompt
+                  (right before assistant response begins).
+                - "mean": Mean of all assistant response token activations (default).
 
         Returns:
             DifferenceInMeansSteering instance with computed vector.
@@ -101,10 +95,10 @@ class DifferenceInMeansSteering(SteeringMode):
         _validate_message_lists(negative_messages, "negative_messages")
 
         positive_activations = _extract_response_activations_batch(
-            backend, tokenizer, positive_messages, layer
+            backend, tokenizer, positive_messages, layer, token_position
         )
         negative_activations = _extract_response_activations_batch(
-            backend, tokenizer, negative_messages, layer
+            backend, tokenizer, negative_messages, layer, token_position
         )
 
         positive_mean = torch.stack(positive_activations).mean(dim=0)
@@ -112,52 +106,6 @@ class DifferenceInMeansSteering(SteeringMode):
 
         return cls(vector=positive_mean - negative_mean)
 
-    @classmethod
-    def from_contrastive_texts(
-        cls,
-        backend: "ModelBackend",
-        positive_texts: List[str],
-        negative_texts: List[str],
-        layer: int,
-        token_position: Union[int, str] = "last",
-    ) -> "DifferenceInMeansSteering":
-        """
-        Compute steering vector from contrastive plain text pairs.
-
-        This is a simpler method for non-chat models or when you want to
-        extract from the entire text without response boundary detection.
-
-        Args:
-            backend: Model backend for extracting activations.
-            positive_texts: List of texts representing the positive concept.
-            negative_texts: List of texts representing the negative concept.
-            layer: Layer index to extract activations from.
-            token_position: Which token position(s) to use for computing means.
-                - "last": Use the last token (default)
-                - "mean": Average over all tokens
-                - int: Use a specific token index
-
-        Returns:
-            DifferenceInMeansSteering instance with computed vector.
-        """
-        if not positive_texts:
-            raise ValueError("positive_texts cannot be empty")
-        if not negative_texts:
-            raise ValueError("negative_texts cannot be empty")
-
-        positive_activations = [
-            _extract_text_activation(backend, text, layer, token_position)
-            for text in positive_texts
-        ]
-        negative_activations = [
-            _extract_text_activation(backend, text, layer, token_position)
-            for text in negative_texts
-        ]
-
-        positive_mean = torch.stack(positive_activations).mean(dim=0)
-        negative_mean = torch.stack(negative_activations).mean(dim=0)
-
-        return cls(vector=positive_mean - negative_mean)
 
     @classmethod
     def from_activations(
@@ -272,21 +220,26 @@ def extract_response_activations(
     tokenizer,
     messages: List[dict],
     layer: int,
+    token_position: Literal["last_prompt_token", "mean"] = "mean",
 ) -> torch.Tensor:
     """
-    Extract mean activation from assistant response tokens only.
+    Extract activation from a conversation based on token position strategy.
 
-    Applies chat template, detects response boundary, and extracts
-    activations from only the assistant's response portion.
+    Applies chat template, detects response boundary using offset mapping
+    for reliable tokenization, and extracts activations based on the
+    specified token position.
 
     Args:
         backend: Model backend.
         tokenizer: Tokenizer with chat template.
         messages: Conversation messages ending with assistant response.
         layer: Layer index to extract from.
+        token_position: Which token position to extract activations from.
+            - "last_prompt_token": Activation at the last token of the prompt.
+            - "mean": Mean of all assistant response token activations.
 
     Returns:
-        Mean activation tensor of shape [hidden_dim].
+        Activation tensor of shape [hidden_dim].
 
     Raises:
         ValueError: If messages don't end with assistant role.
@@ -307,11 +260,31 @@ def extract_response_activations(
         prompt_messages, tokenize=False, add_generation_prompt=True
     )
 
-    # Tokenize to find boundary
-    full_ids = backend.tokenize(full_text)
-    prompt_ids = backend.tokenize(prompt_text)
+    # Verify prompt_text is a prefix of full_text
+    if not full_text.startswith(prompt_text):
+        raise ValueError(
+            "Chat template produced inconsistent results: "
+            "prompt_text is not a prefix of full_text"
+        )
 
-    prompt_len = prompt_ids.shape[1]
+    # Find boundary using offset mapping (tokenize once, avoid boundary issues)
+    prompt_char_end = len(prompt_text)
+    encoding = tokenizer(
+        full_text,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+    )
+    full_ids = encoding["input_ids"].to(backend.get_device())
+    offsets = encoding["offset_mapping"][0]  # [(start, end), ...]
+
+    # Find first token that starts at or after prompt_char_end
+    # This is the first assistant response token
+    prompt_len = len(offsets)  # Default to full length if no boundary found
+    for i, (start, end) in enumerate(offsets):
+        if start >= prompt_char_end:
+            prompt_len = i
+            break
+
     full_len = full_ids.shape[1]
 
     if full_len <= prompt_len:
@@ -319,12 +292,21 @@ def extract_response_activations(
             f"No response tokens found. prompt_len={prompt_len}, full_len={full_len}"
         )
 
-    # Extract activations
+    # Extract activations (uses output hook to get layer output)
     activations = _extract_layer_activations(backend, full_ids, layer)
 
-    # Return mean of response tokens only (includes response + end token)
-    response_activations = activations[prompt_len:full_len]
-    return response_activations.mean(dim=0)
+    if token_position == "last_prompt_token":
+        # Activation at the last token of the prompt (index prompt_len - 1)
+        return activations[prompt_len - 1]
+    elif token_position == "mean":
+        # Mean of assistant response tokens only
+        response_activations = activations[prompt_len:full_len]
+        return response_activations.mean(dim=0)
+    else:
+        raise ValueError(
+            f"Invalid token_position: {token_position}. "
+            "Expected 'last_prompt_token' or 'mean'."
+        )
 
 
 # =============================================================================
@@ -352,35 +334,13 @@ def _extract_response_activations_batch(
     tokenizer,
     messages_list: List[List[dict]],
     layer: int,
+    token_position: Literal["last_prompt_token", "mean"] = "mean",
 ) -> List[torch.Tensor]:
     """Extract response activations for multiple message lists."""
     return [
-        extract_response_activations(backend, tokenizer, messages, layer)
+        extract_response_activations(backend, tokenizer, messages, layer, token_position)
         for messages in messages_list
     ]
-
-
-def _extract_text_activation(
-    backend: "ModelBackend",
-    text: str,
-    layer: int,
-    token_position: Union[int, str],
-) -> torch.Tensor:
-    """Extract activation at specified layer and token position from plain text."""
-    input_ids = backend.tokenize(text)
-    activations = _extract_layer_activations(backend, input_ids, layer)
-
-    if token_position == "last":
-        return activations[-1]
-    elif token_position == "mean":
-        return activations.mean(dim=0)
-    elif isinstance(token_position, int):
-        return activations[token_position]
-    else:
-        raise ValueError(
-            f"Invalid token_position: {token_position}. "
-            "Expected 'last', 'mean', or int."
-        )
 
 
 def _extract_layer_activations(
@@ -388,15 +348,24 @@ def _extract_layer_activations(
     input_ids: torch.Tensor,
     layer: int,
 ) -> torch.Tensor:
-    """Extract all activations at a specific layer."""
+    """
+    Extract layer output activations.
+
+    Uses output hooks (forward hooks) to capture the layer's output,
+    not input. This is important for difference-in-means extraction.
+    """
     captured = []
 
-    def capture_hook(module, args):
-        hidden_states = args[0]
+    def capture_hook(module, args, output):
+        # Output is typically a tuple (hidden_states, ...) or just hidden_states
+        if isinstance(output, tuple):
+            hidden_states = output[0]
+        else:
+            hidden_states = output
         captured.append(hidden_states.detach().clone())
-        return args
+        return output
 
-    with backend.hooks_context([(layer, capture_hook)]):
+    with backend.output_hooks_context([(layer, capture_hook)]):
         _ = backend.get_logits(input_ids)
 
     return captured[0].squeeze(0)  # [seq_len, hidden_dim]

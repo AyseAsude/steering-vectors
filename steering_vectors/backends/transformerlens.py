@@ -58,6 +58,9 @@ class TransformerLensBackend(ModelBackend):
     def register_hook(self, layer: int, hook_fn: Callable) -> Any:
         raise NotImplementedError
 
+    def register_output_hook(self, layer: int, hook_fn: Callable) -> Any:
+        raise NotImplementedError
+
     def remove_hook(self, handle: Any) -> None:
         raise NotImplementedError
 

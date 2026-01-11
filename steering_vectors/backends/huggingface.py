@@ -140,6 +140,23 @@ class HuggingFaceBackend(ModelBackend):
         layer_module = self._get_layer(layer)
         return layer_module.register_forward_pre_hook(hook_fn)
 
+    def register_output_hook(self, layer: int, hook_fn: Callable) -> Any:
+        """
+        Register forward hook at layer to capture output.
+
+        Unlike register_hook (pre-hook), this captures the layer's output.
+        Hook signature: hook_fn(module, args, output) -> output or None
+
+        Args:
+            layer: Layer index.
+            hook_fn: Hook function receiving (module, args, output).
+
+        Returns:
+            Hook handle for later removal.
+        """
+        layer_module = self._get_layer(layer)
+        return layer_module.register_forward_hook(hook_fn)
+
     def remove_hook(self, handle: Any) -> None:
         """Remove hook by handle."""
         handle.remove()

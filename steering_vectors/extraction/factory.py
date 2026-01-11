@@ -34,6 +34,10 @@ def create_extractor(
             - "gradient": Gradient-based optimization.
             - "hybrid": CAA initialization + gradient refinement.
         **kwargs: Method-specific arguments.
+            For CAA:
+                - token_position: "mean", "last", or "last_prompt_token"
+                - remove_outliers: bool, remove extreme outliers before averaging
+                - outlier_std_threshold: float, std dev threshold for outliers
 
     Returns:
         VectorExtractor instance.
@@ -44,6 +48,14 @@ def create_extractor(
     Example:
         >>> # Create CAA extractor (default)
         >>> extractor = create_extractor("caa", token_position="mean")
+        >>>
+        >>> # Create CAA with outlier removal
+        >>> extractor = create_extractor(
+        ...     "caa",
+        ...     token_position="mean",
+        ...     remove_outliers=True,
+        ...     outlier_std_threshold=3.0,
+        ... )
         >>>
         >>> # Create gradient extractor with custom config
         >>> extractor = create_extractor(
@@ -57,6 +69,8 @@ def create_extractor(
     if method == "caa":
         return CAAExtractor(
             token_position=kwargs.get("token_position", "mean"),
+            remove_outliers=kwargs.get("remove_outliers", False),
+            outlier_std_threshold=kwargs.get("outlier_std_threshold", 3.0),
         )
 
     elif method == "gradient":

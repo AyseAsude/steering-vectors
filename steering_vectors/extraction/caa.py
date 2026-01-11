@@ -9,9 +9,11 @@ CAA is the recommended extraction method because:
 - Fast (single forward pass per example)
 - Reliable (doesn't get stuck in local minima)
 - No hyperparameters to tune
+
+Supports optional extreme outlier removal for cleaner vectors.
 """
 
-from typing import Any, List, Literal, TYPE_CHECKING
+from typing import Any, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
@@ -35,9 +37,11 @@ class CAAExtractor(VectorExtractor):
             - "mean": Mean of all response token activations (default).
             - "last": Activation at the last token of the response.
             - "last_prompt_token": Activation at the last prompt token.
+        remove_outliers: If True, remove extreme outliers before averaging.
+        outlier_std_threshold: Std dev threshold for outlier removal (default 3.0).
 
     Example:
-        >>> extractor = CAAExtractor(token_position="mean")
+        >>> extractor = CAAExtractor(token_position="mean", remove_outliers=True)
         >>> result = extractor.extract(backend, tokenizer, pairs, layer=16)
         >>> steering = result.to_steering()
     """
@@ -45,14 +49,20 @@ class CAAExtractor(VectorExtractor):
     def __init__(
         self,
         token_position: Literal["mean", "last", "last_prompt_token"] = "mean",
+        remove_outliers: bool = False,
+        outlier_std_threshold: float = 3.0,
     ):
         """
         Initialize CAA extractor.
 
         Args:
             token_position: Which token position to extract from.
+            remove_outliers: If True, remove extreme outliers (> threshold std devs).
+            outlier_std_threshold: Number of standard deviations for outlier detection.
         """
         self.token_position = token_position
+        self.remove_outliers = remove_outliers
+        self.outlier_std_threshold = outlier_std_threshold
 
     @property
     def method_name(self) -> str:
@@ -103,6 +113,13 @@ class CAAExtractor(VectorExtractor):
             positive_activations.append(pos_act)
             negative_activations.append(neg_act)
 
+        # Optional: Remove extreme outliers before averaging
+        outliers_removed = 0
+        if self.remove_outliers and len(positive_activations) > 3:
+            positive_activations, negative_activations, outliers_removed = (
+                self._remove_extreme_outliers(positive_activations, negative_activations)
+            )
+
         # Compute mean difference
         pos_mean = torch.stack(positive_activations).mean(dim=0)
         neg_mean = torch.stack(negative_activations).mean(dim=0)
@@ -115,9 +132,52 @@ class CAAExtractor(VectorExtractor):
             metadata={
                 "token_position": self.token_position,
                 "num_pairs": len(pairs),
+                "num_pairs_used": len(positive_activations),
+                "outliers_removed": outliers_removed,
                 "vector_norm": vector.norm().item(),
             },
         )
+
+    def _remove_extreme_outliers(
+        self,
+        positive_acts: List[torch.Tensor],
+        negative_acts: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], int]:
+        """Remove extreme outliers based on activation difference norms.
+
+        Identifies pairs where the (positive - negative) activation difference
+        has an L2 norm that is more than `outlier_std_threshold` standard
+        deviations from the mean. Only removes EXTREME outliers.
+
+        Args:
+            positive_acts: List of positive activation tensors.
+            negative_acts: List of negative activation tensors.
+
+        Returns:
+            Tuple of (filtered_positive, filtered_negative, num_removed).
+        """
+        # Compute per-pair difference norms
+        differences = [p - n for p, n in zip(positive_acts, negative_acts)]
+        norms = torch.tensor([d.norm().item() for d in differences])
+
+        # Compute statistics
+        mean_norm = norms.mean()
+        std_norm = norms.std()
+
+        # Identify non-outliers (within threshold)
+        threshold = mean_norm + self.outlier_std_threshold * std_norm
+        mask = norms <= threshold
+
+        # Filter
+        filtered_pos = [p for p, keep in zip(positive_acts, mask) if keep]
+        filtered_neg = [n for n, keep in zip(negative_acts, mask) if keep]
+        num_removed = len(positive_acts) - len(filtered_pos)
+
+        # Safety: keep at least 3 pairs
+        if len(filtered_pos) < 3:
+            return positive_acts, negative_acts, 0
+
+        return filtered_pos, filtered_neg, num_removed
 
     def _extract_from_messages(
         self,

@@ -39,6 +39,18 @@ class ThreadSteeringConfig:
     token_slice: Optional[slice] = None
 
 
+@dataclass
+class ThreadOutputHookConfig:
+    """Per-thread output hook configuration for a single layer."""
+    callback: Callable
+    # Store captured outputs here (the callback can append to this list)
+    captured: List[torch.Tensor] = None
+
+    def __post_init__(self):
+        if self.captured is None:
+            self.captured = []
+
+
 class HuggingFaceBackend(ModelBackend):
     """
     Backend for HuggingFace Transformers models.
@@ -92,9 +104,15 @@ class HuggingFaceBackend(ModelBackend):
         # Each thread has its own isolated steering config
         self._steering_local = threading.local()
 
+        # Thread-local storage for output hooks (used in extraction)
+        # Each thread has its own isolated output hook callbacks
+        self._output_hook_local = threading.local()
+
         # Track if persistent hooks have been registered
         self._steering_hooks_registered = False
         self._steering_hook_handles: List[Any] = []
+        self._output_hooks_registered = False
+        self._output_hook_handles: List[Any] = []
 
         # Ensure model is in eval mode and frozen
         self.model.eval()
@@ -112,6 +130,9 @@ class HuggingFaceBackend(ModelBackend):
 
         # Register persistent steering hooks for all layers
         self._register_persistent_steering_hooks()
+
+        # Register persistent output hooks for all layers (for extraction)
+        self._register_persistent_output_hooks()
 
     def get_hidden_dim(self) -> int:
         """Return hidden dimension from config.
@@ -437,6 +458,122 @@ class HuggingFaceBackend(ModelBackend):
             yield
         finally:
             self._clear_thread_steering()
+
+    # =========================================================================
+    # Thread-Local Output Hooks (for extraction)
+    # =========================================================================
+    # These methods enable fully concurrent extraction without locks.
+
+    def _register_persistent_output_hooks(self) -> None:
+        """Register persistent output hooks on all layers.
+
+        These hooks are registered ONCE at initialization and check thread-local
+        storage to determine if output capture is needed for the current thread.
+        """
+        if self._output_hooks_registered:
+            return
+
+        num_layers = self.get_num_layers()
+
+        for layer_idx in range(num_layers):
+            hook = self._create_thread_local_output_hook(layer_idx)
+            layer_module = self._get_layer(layer_idx)
+            handle = layer_module.register_forward_hook(hook)
+            self._output_hook_handles.append(handle)
+
+        self._output_hooks_registered = True
+
+    def _create_thread_local_output_hook(self, layer_idx: int) -> Callable:
+        """Create an output hook that checks thread-local storage.
+
+        Args:
+            layer_idx: The layer index this hook is registered on.
+
+        Returns:
+            A hook function compatible with register_forward_hook.
+        """
+        output_hook_local = self._output_hook_local  # Capture reference
+
+        def output_hook(module, args, output):
+            # Fast path: check if any output capture is configured for this thread
+            config = getattr(output_hook_local, 'config', None)
+            if config is None:
+                return output  # No capture configured
+
+            # Check if this layer should capture
+            layer_config = config.get(layer_idx)
+            if layer_config is None:
+                return output  # This layer not capturing
+
+            # Call the thread's callback with the output
+            try:
+                result = layer_config.callback(module, args, output)
+                return result if result is not None else output
+            except Exception:
+                # Don't let callback errors crash the forward pass
+                return output
+
+        return output_hook
+
+    def _set_thread_output_hooks(
+        self,
+        hook_infos: List[Tuple[int, Callable]],
+    ) -> None:
+        """Set output hook callbacks for the current thread.
+
+        Args:
+            hook_infos: List of (layer_idx, callback) pairs.
+        """
+        config: Dict[int, ThreadOutputHookConfig] = {}
+        for layer_idx, callback in hook_infos:
+            config[layer_idx] = ThreadOutputHookConfig(callback=callback)
+        self._output_hook_local.config = config
+
+    def _clear_thread_output_hooks(self) -> None:
+        """Clear output hook callbacks for the current thread."""
+        self._output_hook_local.config = None
+
+    @contextmanager
+    def thread_output_hooks_context(
+        self,
+        hook_infos: List[Tuple[int, Callable]],
+    ):
+        """Context manager for thread-local output hooks.
+
+        Thread-safe replacement for output_hooks_context. Multiple threads
+        can use this concurrently without interference.
+
+        Args:
+            hook_infos: List of (layer_idx, callback) pairs.
+
+        Yields:
+            None. Hooks are active within the context.
+        """
+        self._set_thread_output_hooks(hook_infos)
+        try:
+            yield
+        finally:
+            self._clear_thread_output_hooks()
+
+    @contextmanager
+    def output_hooks_context(self, hook_infos: List[Tuple[int, Callable]]):
+        """Context manager for temporary output hooks (thread-safe override).
+
+        This overrides the base class method to use thread-local storage,
+        enabling fully concurrent extraction operations.
+
+        Args:
+            hook_infos: List of (layer, hook_fn) pairs.
+
+        Yields:
+            None. Hooks are active within the context.
+        """
+        # Use thread-local hooks for thread safety
+        self._set_thread_output_hooks(hook_infos)
+        try:
+            yield
+        finally:
+            self._clear_thread_output_hooks()
 
     def register_hook(self, layer: int, hook_fn: Callable) -> Any:
         """Register forward pre-hook at layer."""

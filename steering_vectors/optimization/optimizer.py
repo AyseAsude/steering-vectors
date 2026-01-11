@@ -473,7 +473,8 @@ class SteeringOptimizer:
             return self._compute_batch_loss(datapoints, tokenized_data, layers)
 
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        per_completion_losses: List[List[float]] = [[] for _ in datapoints]
+        # Initialize with same structure as sequential: [[src_losses], [dst_losses]] per datapoint
+        per_completion_losses: List[List[List[float]]] = [[[], []] for _ in datapoints]
 
         # Loss functions
         promotion_loss = PromotionLoss(
@@ -587,9 +588,6 @@ class SteeringOptimizer:
                     # Record per-completion loss
                     dp_idx = comp["dp_idx"]
                     loss_list_idx = 0 if comp["type"] == "src" else 1
-                    # Ensure nested lists exist
-                    while len(per_completion_losses[dp_idx]) <= loss_list_idx:
-                        per_completion_losses[dp_idx].append([])
                     per_completion_losses[dp_idx][loss_list_idx].append(loss.item())
 
         return total_loss, per_completion_losses

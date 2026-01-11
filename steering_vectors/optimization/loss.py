@@ -70,10 +70,11 @@ class PromotionLoss(LossComponent):
         coldness: float = 1.0,
         eps: float = 1e-10,
     ) -> torch.Tensor:
-        """Compute negative log probability of target tokens (vectorized)."""
-        # Use instance eps if larger (more stable)
-        eps = max(eps, self.eps)
+        """Compute negative log probability of target tokens (vectorized).
 
+        Note: Uses self.eps (set at initialization) for numerical stability,
+        ignoring the eps parameter which exists for interface compatibility.
+        """
         total_len = len(target_ids)
         completion_len = total_len - prompt_len
 
@@ -98,7 +99,7 @@ class PromotionLoss(LossComponent):
         ).squeeze(-1)
 
         # Compute negative log probability sum (vectorized)
-        loss = -torch.log(target_probs + eps).sum()
+        loss = -torch.log(target_probs + self.eps).sum()
 
         if self.normalize_by_length:
             loss = loss / completion_len
@@ -145,10 +146,11 @@ class SuppressionLoss(LossComponent):
         coldness: float = 1.0,
         eps: float = 1e-10,
     ) -> torch.Tensor:
-        """Compute suppression loss (vectorized)."""
-        # Use instance eps if larger (more stable)
-        eps = max(eps, self.eps)
+        """Compute suppression loss (vectorized).
 
+        Note: Uses self.eps (set at initialization) for numerical stability,
+        ignoring the eps parameter which exists for interface compatibility.
+        """
         total_len = len(target_ids)
         completion_len = total_len - prompt_len
 
@@ -173,9 +175,9 @@ class SuppressionLoss(LossComponent):
             # Clamp prob to prevent log(0) when prob→1
             # This bounds the gradient to 1/(1-max_prob) ≈ 10000 instead of infinity
             target_probs_clamped = torch.clamp(target_probs, max=self.max_prob)
-            loss = -torch.log(1 - target_probs_clamped + eps).sum()
+            loss = -torch.log(1 - target_probs_clamped + self.eps).sum()
         else:
-            loss = torch.log(target_probs + eps).sum()
+            loss = torch.log(target_probs + self.eps).sum()
 
         if self.normalize_by_length:
             loss = loss / completion_len

@@ -19,6 +19,8 @@ class OptimizationConfig(BaseModel):
         satisfice: If True, optimize squared diff from per-datapoint target losses.
         normalize_by_length: Divide loss by completion length.
         use_one_minus: For suppression, use log(1-p) vs -log(p).
+        use_batched: Use batched forward passes for faster optimization.
+        batch_size: Batch size for batched optimization.
     """
 
     # Basic optimization
@@ -36,6 +38,30 @@ class OptimizationConfig(BaseModel):
     satisfice: bool = False
     normalize_by_length: bool = False
     use_one_minus: bool = True
+
+    # Batched optimization (performance)
+    use_batched: bool = Field(
+        default=True,
+        description="Use batched forward passes for 10-50x faster optimization.",
+    )
+    batch_size: int = Field(
+        default=16,
+        gt=0,
+        le=128,
+        description="Batch size for batched optimization. Larger = faster but more memory.",
+    )
+
+    # Numerical stability
+    grad_clip_value: Optional[float] = Field(
+        default=1.0,
+        gt=0,
+        description="Clip gradient values to this magnitude to prevent NaN from gradient explosion.",
+    )
+    loss_eps: float = Field(
+        default=1e-6,
+        gt=0,
+        description="Epsilon for numerical stability in log computations. Larger = more stable but less precise.",
+    )
 
     class Config:
         frozen = False  # Allow modification after creation

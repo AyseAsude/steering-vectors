@@ -262,13 +262,48 @@ class CAAExtractor(VectorExtractor):
         prompt_len: int,
         full_len: int,
     ) -> torch.Tensor:
-        """Select activation based on token_position strategy."""
+        """Select activation based on token_position strategy.
+
+        Args:
+            activations: Hidden states tensor of shape [seq_len, hidden_dim].
+            prompt_len: Number of prompt tokens.
+            full_len: Total sequence length (prompt + response).
+
+        Returns:
+            Selected activation tensor of shape [hidden_dim].
+
+        Note:
+            Uses bounds checking to handle cases where activations tensor
+            may be shorter than expected (due to model truncation, etc.).
+        """
+        actual_len = activations.shape[0]
+
+        # Bounds check: ensure indices are within activations tensor
+        if actual_len < prompt_len:
+            # Fallback: use last available activation
+            import logging
+            logging.warning(
+                f"Activation length ({actual_len}) < prompt_len ({prompt_len}). "
+                "Using last available activation."
+            )
+            return activations[-1]
+
         if self.token_position == "last_prompt_token":
-            return activations[prompt_len - 1]
+            # Last token of prompt
+            idx = min(prompt_len - 1, actual_len - 1)
+            return activations[idx]
         elif self.token_position == "last":
-            return activations[full_len - 1]
+            # Last token of full sequence
+            idx = min(full_len - 1, actual_len - 1)
+            return activations[idx]
         elif self.token_position == "mean":
-            response_activations = activations[prompt_len:full_len]
+            # Mean of response tokens
+            end_idx = min(full_len, actual_len)
+            start_idx = min(prompt_len, end_idx)
+            if start_idx >= end_idx:
+                # No response tokens available, use last prompt token
+                return activations[min(prompt_len - 1, actual_len - 1)]
+            response_activations = activations[start_idx:end_idx]
             return response_activations.mean(dim=0)
         else:
             raise ValueError(f"Unknown token_position: {self.token_position}")

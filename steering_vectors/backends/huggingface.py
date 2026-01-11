@@ -27,6 +27,7 @@ class HuggingFaceBackend(ModelBackend):
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
         device: Optional[str] = None,
+        gradient_checkpointing: bool = False,
     ):
         """
         Initialize HuggingFace backend.
@@ -35,15 +36,27 @@ class HuggingFaceBackend(ModelBackend):
             model: A HuggingFace causal LM.
             tokenizer: The corresponding tokenizer.
             device: Device override. If None, uses model's device.
+            gradient_checkpointing: Enable gradient checkpointing to reduce
+                memory usage at the cost of ~30% slower backward pass.
         """
         self.model = model
         self.tokenizer = tokenizer
         self._device = device
+        self._gradient_checkpointing = gradient_checkpointing
 
         # Ensure model is in eval mode and frozen
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
+
+        # Enable gradient checkpointing if requested
+        if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+
+        # Setup padding token for batched operations
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
     def get_hidden_dim(self) -> int:
         """Return hidden dimension from config.
@@ -103,6 +116,78 @@ class HuggingFaceBackend(ModelBackend):
         """Tokenize text to tensor."""
         return self.tokenizer(text, return_tensors="pt").input_ids.to(self.get_device())
 
+    def tokenize_batch(
+        self,
+        texts: List[str],
+        padding: bool = True,
+        return_attention_mask: bool = True,
+    ) -> dict:
+        """Tokenize multiple texts with padding.
+
+        Args:
+            texts: List of texts to tokenize.
+            padding: Whether to pad sequences to same length.
+            return_attention_mask: Whether to return attention mask.
+
+        Returns:
+            Dictionary with 'input_ids' and optionally 'attention_mask'.
+        """
+        encoded = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=padding,
+            truncation=True,
+            return_attention_mask=return_attention_mask,
+        )
+        return {k: v.to(self.get_device()) for k, v in encoded.items()}
+
+    def pad_sequences(
+        self,
+        sequences: List[torch.Tensor],
+        padding_value: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pad a list of token sequences to the same length.
+
+        Args:
+            sequences: List of tensors, each (1, seq_len) or (seq_len,).
+            padding_value: Value to use for padding. Defaults to pad_token_id.
+
+        Returns:
+            Tuple of (padded_ids, attention_mask), each (batch, max_len).
+        """
+        if padding_value is None:
+            padding_value = self.tokenizer.pad_token_id
+
+        # Normalize to 1D tensors
+        seqs_1d = []
+        for seq in sequences:
+            if seq.dim() == 2:
+                seq = seq.squeeze(0)
+            seqs_1d.append(seq)
+
+        # Find max length
+        max_len = max(len(s) for s in seqs_1d)
+
+        # Pad sequences (left padding for causal LMs)
+        padded = []
+        masks = []
+        for seq in seqs_1d:
+            pad_len = max_len - len(seq)
+            if pad_len > 0:
+                padding = torch.full((pad_len,), padding_value, dtype=seq.dtype, device=seq.device)
+                padded_seq = torch.cat([padding, seq])
+                mask = torch.cat([
+                    torch.zeros(pad_len, dtype=torch.long, device=seq.device),
+                    torch.ones(len(seq), dtype=torch.long, device=seq.device),
+                ])
+            else:
+                padded_seq = seq
+                mask = torch.ones(len(seq), dtype=torch.long, device=seq.device)
+            padded.append(padded_seq)
+            masks.append(mask)
+
+        return torch.stack(padded), torch.stack(masks)
+
     def decode(self, token_ids: torch.Tensor) -> str:
         """Decode token IDs to text."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -148,13 +233,65 @@ class HuggingFaceBackend(ModelBackend):
         self,
         input_ids: torch.Tensor,
         hooks: Optional[List[Tuple[int, Callable]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run forward pass with optional hooks."""
+        """Run forward pass with optional hooks.
+
+        Args:
+            input_ids: Input token IDs (batch, seq_len).
+            hooks: List of (layer, hook_fn) pairs to apply.
+            attention_mask: Optional attention mask (batch, seq_len).
+                Required for padded batches.
+
+        Returns:
+            Logits tensor (batch, seq_len, vocab_size).
+        """
         hooks = hooks or []
 
         with self.hooks_context(hooks):
-            outputs = self.model(input_ids, use_cache=False)
+            outputs = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
             return outputs.logits
+
+    def get_logits_batched(
+        self,
+        sequences: List[torch.Tensor],
+        hooks: Optional[List[Tuple[int, Callable]]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """Run batched forward pass on variable-length sequences.
+
+        Pads sequences and runs a single forward pass for efficiency.
+
+        Args:
+            sequences: List of token ID tensors, each (1, seq_len) or (seq_len,).
+            hooks: List of (layer, hook_fn) pairs to apply.
+
+        Returns:
+            Tuple of (logits, attention_mask, original_lengths).
+            logits: (batch, max_len, vocab).
+            attention_mask: (batch, max_len).
+            original_lengths: Original length of each sequence.
+        """
+        hooks = hooks or []
+
+        # Record original lengths
+        original_lengths = []
+        for seq in sequences:
+            if seq.dim() == 2:
+                original_lengths.append(seq.shape[1])
+            else:
+                original_lengths.append(len(seq))
+
+        # Pad sequences
+        padded_ids, attention_mask = self.pad_sequences(sequences)
+
+        # Single forward pass
+        logits = self.get_logits(padded_ids, hooks=hooks, attention_mask=attention_mask)
+
+        return logits, attention_mask, original_lengths
 
     def generate_batch(
         self,
@@ -242,7 +379,7 @@ class HuggingFaceBackend(ModelBackend):
         log_prob: bool = True,
     ) -> float:
         """
-        Compute (log) probability of completion given prompt.
+        Compute (log) probability of completion given prompt (vectorized).
 
         Matches steering_opt.get_completion_logprob_hf behavior.
         """
@@ -253,17 +390,30 @@ class HuggingFaceBackend(ModelBackend):
 
         prompt_len = prompt_ids.shape[1]
         total_len = full_ids.shape[1]
+        completion_len = total_len - prompt_len
+
+        # Handle empty completion
+        if completion_len <= 0:
+            return 0.0
 
         with self.hooks_context(hooks):
             logits = self.get_logits(full_ids, hooks=[])[0].float()
 
         probs = torch.softmax(logits * coldness, dim=-1)
 
-        total_log_prob = 0.0
-        for i in range(prompt_len, total_len):
-            target_token = full_ids[0, i]
-            prob = probs[i - 1, target_token]
-            total_log_prob += torch.log(prob + 1e-10).item()
+        # Get completion token IDs
+        completion_ids = full_ids[0, prompt_len:total_len]
+
+        # Get probabilities for completion tokens (shifted by 1 for autoregressive)
+        completion_probs = probs[prompt_len - 1 : total_len - 1]
+
+        # Gather target token probabilities
+        target_probs = completion_probs.gather(
+            dim=-1, index=completion_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Compute log probability sum
+        total_log_prob = torch.log(target_probs + 1e-10).sum().item()
 
         return total_log_prob if log_prob else torch.exp(torch.tensor(total_log_prob)).item()
 
@@ -275,7 +425,7 @@ class HuggingFaceBackend(ModelBackend):
         coldness: float = 1.0,
     ) -> float:
         """
-        Compute log(1 - P(completion)) for suppression loss.
+        Compute log(1 - P(completion)) for suppression loss (vectorized).
 
         Used when suppressing completions.
         """
@@ -286,16 +436,29 @@ class HuggingFaceBackend(ModelBackend):
 
         prompt_len = prompt_ids.shape[1]
         total_len = full_ids.shape[1]
+        completion_len = total_len - prompt_len
+
+        # Handle empty completion
+        if completion_len <= 0:
+            return 0.0
 
         with self.hooks_context(hooks):
             logits = self.get_logits(full_ids, hooks=[])[0].float()
 
         probs = torch.softmax(logits * coldness, dim=-1)
 
-        total_log_prob = 0.0
-        for i in range(prompt_len, total_len):
-            target_token = full_ids[0, i]
-            prob = 1 - probs[i - 1, target_token]
-            total_log_prob += torch.log(prob + 1e-10).item()
+        # Get completion token IDs
+        completion_ids = full_ids[0, prompt_len:total_len]
+
+        # Get probabilities for completion tokens (shifted by 1 for autoregressive)
+        completion_probs = probs[prompt_len - 1 : total_len - 1]
+
+        # Gather target token probabilities
+        target_probs = completion_probs.gather(
+            dim=-1, index=completion_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Compute log(1 - p) sum
+        total_log_prob = torch.log(1 - target_probs + 1e-10).sum().item()
 
         return total_log_prob

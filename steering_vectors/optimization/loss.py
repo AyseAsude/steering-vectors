@@ -70,22 +70,38 @@ class PromotionLoss(LossComponent):
         coldness: float = 1.0,
         eps: float = 1e-10,
     ) -> torch.Tensor:
-        """Compute negative log probability of target tokens."""
+        """Compute negative log probability of target tokens (vectorized)."""
         # Use instance eps if larger (more stable)
         eps = max(eps, self.eps)
 
-        probs = torch.softmax(logits * coldness, dim=-1)
         total_len = len(target_ids)
+        completion_len = total_len - prompt_len
 
-        loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        # Handle empty completion
+        if completion_len <= 0:
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
-        for i in range(prompt_len, total_len):
-            target_token = target_ids[i]
-            prob = probs[i - 1, target_token]
-            loss = loss - torch.log(prob + eps)
+        probs = torch.softmax(logits * coldness, dim=-1)
 
-        if self.normalize_by_length and (total_len - prompt_len) > 0:
-            loss = loss / (total_len - prompt_len)
+        # Get completion token IDs (tokens we're predicting)
+        completion_ids = target_ids[prompt_len:total_len]
+
+        # Get probabilities for those tokens from the previous position's logits
+        # logits[i-1] predicts token[i], so we need logits[prompt_len-1:total_len-1]
+        completion_logit_probs = probs[prompt_len - 1 : total_len - 1]
+
+        # Gather the probabilities for the actual target tokens
+        # completion_ids shape: [completion_len]
+        # completion_logit_probs shape: [completion_len, vocab_size]
+        target_probs = completion_logit_probs.gather(
+            dim=-1, index=completion_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Compute negative log probability sum (vectorized)
+        loss = -torch.log(target_probs + eps).sum()
+
+        if self.normalize_by_length:
+            loss = loss / completion_len
 
         return loss
 
@@ -129,29 +145,40 @@ class SuppressionLoss(LossComponent):
         coldness: float = 1.0,
         eps: float = 1e-10,
     ) -> torch.Tensor:
-        """Compute suppression loss."""
+        """Compute suppression loss (vectorized)."""
         # Use instance eps if larger (more stable)
         eps = max(eps, self.eps)
 
-        probs = torch.softmax(logits * coldness, dim=-1)
         total_len = len(target_ids)
+        completion_len = total_len - prompt_len
 
-        loss = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        # Handle empty completion
+        if completion_len <= 0:
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
 
-        for i in range(prompt_len, total_len):
-            target_token = target_ids[i]
-            prob = probs[i - 1, target_token]
+        probs = torch.softmax(logits * coldness, dim=-1)
 
-            if self.use_one_minus:
-                # Clamp prob to prevent log(0) when prob→1
-                # This bounds the gradient to 1/(1-max_prob) ≈ 10000 instead of infinity
-                prob_clamped = torch.clamp(prob, max=self.max_prob)
-                loss = loss - torch.log(1 - prob_clamped + eps)
-            else:
-                loss = loss + torch.log(prob + eps)
+        # Get completion token IDs (tokens we're predicting)
+        completion_ids = target_ids[prompt_len:total_len]
 
-        if self.normalize_by_length and (total_len - prompt_len) > 0:
-            loss = loss / (total_len - prompt_len)
+        # Get probabilities for those tokens from the previous position's logits
+        completion_logit_probs = probs[prompt_len - 1 : total_len - 1]
+
+        # Gather the probabilities for the actual target tokens
+        target_probs = completion_logit_probs.gather(
+            dim=-1, index=completion_ids.unsqueeze(-1)
+        ).squeeze(-1)
+
+        if self.use_one_minus:
+            # Clamp prob to prevent log(0) when prob→1
+            # This bounds the gradient to 1/(1-max_prob) ≈ 10000 instead of infinity
+            target_probs_clamped = torch.clamp(target_probs, max=self.max_prob)
+            loss = -torch.log(1 - target_probs_clamped + eps).sum()
+        else:
+            loss = torch.log(target_probs + eps).sum()
+
+        if self.normalize_by_length:
+            loss = loss / completion_len
 
         return loss
 

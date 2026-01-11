@@ -1,5 +1,6 @@
 """HuggingFace Transformers backend."""
 
+import threading
 from typing import Any, Callable, List, Optional, Tuple
 from contextlib import contextmanager
 
@@ -43,6 +44,11 @@ class HuggingFaceBackend(ModelBackend):
         self.tokenizer = tokenizer
         self._device = device
         self._gradient_checkpointing = gradient_checkpointing
+
+        # Lock for thread-safe generation with hooks
+        # Prevents race condition where concurrent threads register hooks
+        # on the same model, causing hook stacking and garbled output
+        self._generation_lock = threading.Lock()
 
         # Ensure model is in eval mode and frozen
         self.model.eval()
@@ -322,6 +328,9 @@ class HuggingFaceBackend(ModelBackend):
         """
         Generate text for multiple prompts in a batch.
 
+        Thread-safe when hooks are provided: uses a lock to prevent
+        concurrent hook registration which would cause hook stacking.
+
         Args:
             prompts: List of input prompts.
             max_new_tokens: Maximum tokens to generate.
@@ -356,7 +365,16 @@ class HuggingFaceBackend(ModelBackend):
             **kwargs,
         }
 
-        with self.hooks_context(hooks):
+        # When hooks are provided, acquire lock to prevent concurrent
+        # threads from stacking hooks on the shared model.
+        # Without lock: Thread A registers hook, Thread B registers hook,
+        # both see 2 hooks -> doubled steering strength -> garbage output.
+        if hooks:
+            with self._generation_lock:
+                with self.hooks_context(hooks):
+                    output_ids = self.model.generate(**inputs, **generation_kwargs)
+        else:
+            # No hooks = no lock needed, allow full parallelism
             output_ids = self.model.generate(**inputs, **generation_kwargs)
 
         # Restore original padding side

@@ -53,12 +53,14 @@ class PromotionLoss(LossComponent):
     Used for dst_completions (things we want the model to say).
     """
 
-    def __init__(self, normalize_by_length: bool = False):
+    def __init__(self, normalize_by_length: bool = False, eps: float = 1e-6):
         """
         Args:
             normalize_by_length: If True, divide by completion length.
+            eps: Small constant for numerical stability.
         """
         self.normalize_by_length = normalize_by_length
+        self.eps = eps
 
     def compute(
         self,
@@ -69,6 +71,9 @@ class PromotionLoss(LossComponent):
         eps: float = 1e-10,
     ) -> torch.Tensor:
         """Compute negative log probability of target tokens."""
+        # Use instance eps if larger (more stable)
+        eps = max(eps, self.eps)
+
         probs = torch.softmax(logits * coldness, dim=-1)
         total_len = len(target_ids)
 
@@ -101,14 +106,20 @@ class SuppressionLoss(LossComponent):
         self,
         use_one_minus: bool = True,
         normalize_by_length: bool = False,
+        eps: float = 1e-6,
+        max_prob: float = 0.9999,
     ):
         """
         Args:
             use_one_minus: Use log(1-p) vs -log(p).
             normalize_by_length: If True, divide by completion length.
+            eps: Small constant for numerical stability.
+            max_prob: Clamp probability to this max to prevent log(0) in use_one_minus mode.
         """
         self.use_one_minus = use_one_minus
         self.normalize_by_length = normalize_by_length
+        self.eps = eps
+        self.max_prob = max_prob
 
     def compute(
         self,
@@ -119,6 +130,9 @@ class SuppressionLoss(LossComponent):
         eps: float = 1e-10,
     ) -> torch.Tensor:
         """Compute suppression loss."""
+        # Use instance eps if larger (more stable)
+        eps = max(eps, self.eps)
+
         probs = torch.softmax(logits * coldness, dim=-1)
         total_len = len(target_ids)
 
@@ -129,7 +143,10 @@ class SuppressionLoss(LossComponent):
             prob = probs[i - 1, target_token]
 
             if self.use_one_minus:
-                loss = loss - torch.log(1 - prob + eps)
+                # Clamp prob to prevent log(0) when prob→1
+                # This bounds the gradient to 1/(1-max_prob) ≈ 10000 instead of infinity
+                prob_clamped = torch.clamp(prob, max=self.max_prob)
+                loss = loss - torch.log(1 - prob_clamped + eps)
             else:
                 loss = loss + torch.log(prob + eps)
 

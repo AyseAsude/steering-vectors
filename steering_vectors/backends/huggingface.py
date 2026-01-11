@@ -1,13 +1,42 @@
-"""HuggingFace Transformers backend."""
+"""HuggingFace Transformers backend.
+
+Thread-Safe Steering Architecture:
+----------------------------------
+This backend supports fully concurrent steered generation without locks by using
+thread-local storage for steering parameters. Each thread has its own isolated
+steering configuration that doesn't interfere with other threads.
+
+How it works:
+1. Persistent hooks are registered ONCE at initialization for all layers
+2. Each hook checks thread-local storage for steering parameters
+3. If no steering is set for the current thread, hooks are no-ops (pass-through)
+4. Each thread sets its steering config, generates, then clears it
+5. No locks needed - thread-local storage provides isolation
+
+This enables true parallel steered generation across multiple threads.
+"""
 
 import threading
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from steering_vectors.backends.base import ModelBackend
+
+if TYPE_CHECKING:
+    from steering_vectors.steering.base import SteeringMode
+    from steering_vectors.core.types import LayerSpec, TokenSpec
+
+
+@dataclass
+class ThreadSteeringConfig:
+    """Per-thread steering configuration for a single layer."""
+    vector: torch.Tensor
+    strength: float
+    token_slice: Optional[slice] = None
 
 
 class HuggingFaceBackend(ModelBackend):
@@ -16,11 +45,25 @@ class HuggingFaceBackend(ModelBackend):
 
     Supports Llama-like architectures with model.model.layers structure.
 
+    Thread Safety:
+        This backend supports fully concurrent steered generation. Multiple
+        threads can generate with different steering vectors simultaneously
+        without interference or locks. Each thread's steering is isolated
+        via thread-local storage.
+
     Example:
         >>> from transformers import AutoModelForCausalLM, AutoTokenizer
         >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
         >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
         >>> backend = HuggingFaceBackend(model, tokenizer)
+        >>>
+        >>> # Concurrent steered generation from multiple threads - no locks!
+        >>> import concurrent.futures
+        >>> with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        ...     futures = [
+        ...         executor.submit(backend.generate_with_steering, prompt, steering, layer, strength)
+        ...         for prompt, steering, layer, strength in jobs
+        ...     ]
     """
 
     def __init__(
@@ -45,10 +88,13 @@ class HuggingFaceBackend(ModelBackend):
         self._device = device
         self._gradient_checkpointing = gradient_checkpointing
 
-        # Lock for thread-safe generation with hooks
-        # Prevents race condition where concurrent threads register hooks
-        # on the same model, causing hook stacking and garbled output
-        self._generation_lock = threading.Lock()
+        # Thread-local storage for steering parameters
+        # Each thread has its own isolated steering config
+        self._steering_local = threading.local()
+
+        # Track if persistent hooks have been registered
+        self._steering_hooks_registered = False
+        self._steering_hook_handles: List[Any] = []
 
         # Ensure model is in eval mode and frozen
         self.model.eval()
@@ -63,6 +109,9 @@ class HuggingFaceBackend(ModelBackend):
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # Register persistent steering hooks for all layers
+        self._register_persistent_steering_hooks()
 
     def get_hidden_dim(self) -> int:
         """Return hidden dimension from config.
@@ -226,6 +275,169 @@ class HuggingFaceBackend(ModelBackend):
             f"Expected 'model.layers', 'gpt_neox.layers', 'language_model.model.layers', or 'language_model.layers'."
         )
 
+    # =========================================================================
+    # Thread-Local Steering System
+    # =========================================================================
+    # These methods enable fully concurrent steered generation without locks.
+    # Each thread has isolated steering config via threading.local().
+
+    def _register_persistent_steering_hooks(self) -> None:
+        """Register persistent steering hooks on all layers.
+
+        These hooks are registered ONCE at initialization and remain active
+        for the lifetime of the backend. They check thread-local storage
+        to determine if steering should be applied for the current thread.
+
+        This design eliminates the need for per-generation hook registration,
+        which was the source of thread-safety issues requiring locks.
+        """
+        if self._steering_hooks_registered:
+            return
+
+        num_layers = self.get_num_layers()
+
+        for layer_idx in range(num_layers):
+            hook = self._create_thread_local_steering_hook(layer_idx)
+            layer_module = self._get_layer(layer_idx)
+            handle = layer_module.register_forward_pre_hook(hook)
+            self._steering_hook_handles.append(handle)
+
+        self._steering_hooks_registered = True
+
+    def _create_thread_local_steering_hook(self, layer_idx: int) -> Callable:
+        """Create a steering hook that reads from thread-local storage.
+
+        The hook is a closure that captures:
+        - layer_idx: The layer this hook is for
+        - self._steering_local: Reference to thread-local storage
+
+        At runtime, the hook:
+        1. Checks if steering is configured for this thread
+        2. If not, returns unchanged (fast no-op path)
+        3. If yes, checks if this layer should be steered
+        4. If yes, applies the steering transformation
+
+        Args:
+            layer_idx: The layer index this hook is registered on.
+
+        Returns:
+            A hook function compatible with register_forward_pre_hook.
+        """
+        steering_local = self._steering_local  # Capture reference
+
+        def steering_hook(module, args):
+            # Fast path: check if any steering is configured for this thread
+            config = getattr(steering_local, 'config', None)
+            if config is None:
+                return args  # No steering, pass through unchanged
+
+            # Check if this layer should be steered
+            layer_config = config.get(layer_idx)
+            if layer_config is None:
+                return args  # This layer not steered
+
+            # Apply steering transformation
+            hidden_states = args[0]  # Shape: [batch, seq_len, hidden_dim]
+            vector = layer_config.vector
+            strength = layer_config.strength
+            token_slice = layer_config.token_slice
+
+            # Determine which tokens to steer
+            if token_slice is not None:
+                # Steer only specified tokens
+                steered = hidden_states.clone()
+                steered[:, token_slice, :] = steered[:, token_slice, :] + strength * vector
+                return (steered,) + args[1:]
+            else:
+                # Steer all tokens
+                return (hidden_states + strength * vector,) + args[1:]
+
+        return steering_hook
+
+    def _set_thread_steering(
+        self,
+        layers: List[int],
+        vector: torch.Tensor,
+        strength: float = 1.0,
+        token_slice: Optional[slice] = None,
+    ) -> None:
+        """Set steering configuration for the current thread.
+
+        This configures which layers to steer and with what parameters.
+        The steering will only affect generation calls made from this thread.
+
+        Thread Safety:
+            Uses threading.local() which guarantees complete isolation.
+            Each thread has its own 'config' attribute that is invisible
+            to other threads. This is a Python language guarantee.
+
+        Args:
+            layers: List of layer indices to apply steering at.
+            vector: The steering vector to add to activations.
+            strength: Multiplier for the steering vector.
+            token_slice: Optional slice specifying which token positions to steer.
+        """
+        # Detach and clone vector to ensure complete isolation
+        # This prevents any gradient graph sharing between threads
+        isolated_vector = vector.detach().clone()
+
+        config: Dict[int, ThreadSteeringConfig] = {}
+        for layer_idx in layers:
+            config[layer_idx] = ThreadSteeringConfig(
+                vector=isolated_vector,
+                strength=strength,
+                token_slice=token_slice,
+            )
+        self._steering_local.config = config
+
+    def _clear_thread_steering(self) -> None:
+        """Clear steering configuration for the current thread.
+
+        Must be called after generation to prevent steering from leaking
+        to subsequent operations on the same thread.
+        """
+        self._steering_local.config = None
+
+    def _get_thread_steering(self) -> Optional[Dict[int, ThreadSteeringConfig]]:
+        """Get the current thread's steering configuration.
+
+        Returns:
+            The steering config dict, or None if no steering is configured.
+        """
+        return getattr(self._steering_local, 'config', None)
+
+    @contextmanager
+    def thread_steering_context(
+        self,
+        layers: List[int],
+        vector: torch.Tensor,
+        strength: float = 1.0,
+        token_slice: Optional[slice] = None,
+    ):
+        """Context manager for thread-local steering.
+
+        Safely sets and clears steering configuration for the current thread.
+        Use this to ensure steering is always cleaned up, even on exceptions.
+
+        Args:
+            layers: List of layer indices to apply steering at.
+            vector: The steering vector to add to activations.
+            strength: Multiplier for the steering vector.
+            token_slice: Optional slice specifying which token positions to steer.
+
+        Yields:
+            None. Steering is active within the context.
+
+        Example:
+            >>> with backend.thread_steering_context([16], vector, strength=1.5):
+            ...     output = backend.generate_batch(prompts)
+        """
+        self._set_thread_steering(layers, vector, strength, token_slice)
+        try:
+            yield
+        finally:
+            self._clear_thread_steering()
+
     def register_hook(self, layer: int, hook_fn: Callable) -> Any:
         """Register forward pre-hook at layer."""
         layer_module = self._get_layer(layer)
@@ -328,21 +540,61 @@ class HuggingFaceBackend(ModelBackend):
         """
         Generate text for multiple prompts in a batch.
 
-        Thread-safe when hooks are provided: uses a lock to prevent
-        concurrent hook registration which would cause hook stacking.
+        For custom hooks (non-steering), this method uses traditional hook
+        registration. For steered generation, use generate_with_steering_batch()
+        which uses thread-local steering for full parallelism.
 
         Args:
             prompts: List of input prompts.
             max_new_tokens: Maximum tokens to generate.
             temperature: Sampling temperature.
             do_sample: Whether to sample or use greedy.
-            hooks: Optional hooks to apply during generation.
+            hooks: Optional custom hooks to apply during generation.
             **kwargs: Additional generation arguments.
 
         Returns:
             List of generated texts (one per prompt).
         """
-        hooks = hooks or []
+        # Use the internal generation method
+        return self._generate_batch_internal(
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            custom_hooks=hooks,
+            **kwargs,
+        )
+
+    def _generate_batch_internal(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        custom_hooks: Optional[List[Tuple[int, Callable]]] = None,
+        **kwargs,
+    ) -> List[str]:
+        """Internal batch generation with thread-local steering support.
+
+        This method handles both:
+        1. Thread-local steering (via _steering_local) - no lock needed
+        2. Custom hooks (via custom_hooks param) - uses hooks_context
+
+        The thread-local steering hooks are always active but are no-ops
+        when no steering is configured for the current thread.
+
+        Args:
+            prompts: List of input prompts.
+            max_new_tokens: Maximum tokens to generate.
+            temperature: Sampling temperature.
+            do_sample: Whether to sample or use greedy.
+            custom_hooks: Optional custom hooks (extraction, etc.) - NOT for steering.
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            List of generated texts (one per prompt).
+        """
+        custom_hooks = custom_hooks or []
 
         # Set up padding for batch generation
         original_padding_side = self.tokenizer.padding_side
@@ -365,16 +617,15 @@ class HuggingFaceBackend(ModelBackend):
             **kwargs,
         }
 
-        # When hooks are provided, acquire lock to prevent concurrent
-        # threads from stacking hooks on the shared model.
-        # Without lock: Thread A registers hook, Thread B registers hook,
-        # both see 2 hooks -> doubled steering strength -> garbage output.
-        if hooks:
-            with self._generation_lock:
-                with self.hooks_context(hooks):
-                    output_ids = self.model.generate(**inputs, **generation_kwargs)
+        # Generate with optional custom hooks
+        # Note: Thread-local steering hooks are ALWAYS active (registered at init)
+        # They check _steering_local and apply steering only if configured
+        if custom_hooks:
+            # Custom hooks need the context manager (for extraction, etc.)
+            with self.hooks_context(custom_hooks):
+                output_ids = self.model.generate(**inputs, **generation_kwargs)
         else:
-            # No hooks = no lock needed, allow full parallelism
+            # No custom hooks - thread-local steering still works via persistent hooks
             output_ids = self.model.generate(**inputs, **generation_kwargs)
 
         # Restore original padding side
@@ -385,6 +636,73 @@ class HuggingFaceBackend(ModelBackend):
         return self.tokenizer.batch_decode(
             output_ids[:, input_len:], skip_special_tokens=True
         )
+
+    def generate_with_steering_batch(
+        self,
+        prompts: List[str],
+        steering_mode: "SteeringMode",
+        layers: "LayerSpec",
+        strength: float = 1.0,
+        token_slice: "TokenSpec" = None,
+        **kwargs,
+    ) -> List[str]:
+        """Generate text for multiple prompts with steering applied.
+
+        This method uses thread-local steering for full parallelism.
+        Multiple threads can call this concurrently with different steering
+        vectors without interference - no locks required.
+
+        Args:
+            prompts: List of input prompts.
+            steering_mode: The steering mode containing the vector.
+            layers: Layer(s) to apply steering at.
+            strength: Steering strength multiplier.
+            token_slice: Which tokens to steer (None = all).
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            List of generated texts.
+        """
+        # Normalize layers to list
+        if isinstance(layers, int):
+            layers = [layers]
+
+        # Get the steering vector from the steering mode
+        vector = steering_mode.vector
+
+        # Use thread-local steering context for isolation
+        with self.thread_steering_context(layers, vector, strength, token_slice):
+            return self._generate_batch_internal(prompts, **kwargs)
+
+    def generate_with_steering(
+        self,
+        prompt: str,
+        steering_mode: "SteeringMode",
+        layers: "LayerSpec",
+        strength: float = 1.0,
+        token_slice: "TokenSpec" = None,
+        **kwargs,
+    ) -> str:
+        """Generate text with steering applied.
+
+        This method uses thread-local steering for full parallelism.
+        Multiple threads can call this concurrently with different steering
+        vectors without interference - no locks required.
+
+        Args:
+            prompt: Input prompt.
+            steering_mode: The steering mode containing the vector.
+            layers: Layer(s) to apply steering at.
+            strength: Steering strength multiplier.
+            token_slice: Which tokens to steer (None = all).
+            **kwargs: Additional generation arguments.
+
+        Returns:
+            Generated text.
+        """
+        return self.generate_with_steering_batch(
+            [prompt], steering_mode, layers, strength, token_slice, **kwargs
+        )[0]
 
     def generate(
         self,

@@ -7,6 +7,18 @@ A research platform for LLM activation engineering and steering vector extractio
 ## Installation
 
 ```bash
+uv pip install steerex
+```
+
+Or with pip:
+```bash
+pip install steerex
+```
+
+For development:
+```bash
+git clone https://github.com/AyseAsude/steerex.git
+cd steerex
 uv pip install -e ".[dev]"
 ```
 

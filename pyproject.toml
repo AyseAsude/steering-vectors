@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "steering-vectors"
+name = "steerex"
 version = "0.1.0"
 description = "A research platform for LLM steering vector optimization and analysis"
 readme = "README.md"
@@ -50,16 +50,16 @@ dev = [
     "mypy>=1.0.0",
 ]
 all = [
-    "steering-vectors[analysis,dev]",
+    "steerex[analysis,dev]",
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-username/steering-vectors"
-Documentation = "https://github.com/your-username/steering-vectors#readme"
-Repository = "https://github.com/your-username/steering-vectors"
+Homepage = "https://github.com/AyseAsude/steerex"
+Documentation = "https://github.com/AyseAsude/steerex#readme"
+Repository = "https://github.com/AyseAsude/steerex"
 
 [tool.hatch.build.targets.wheel]
-packages = ["steering_vectors"]
+packages = ["steerex"]
 
 [tool.ruff]
 line-length = 88
